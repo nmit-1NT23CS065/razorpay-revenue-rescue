@@ -1,0 +1,21 @@
+html {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  background: #f5f6f8;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+  margin: 0;
+  padding: 0;
+  text-align: left;
+}

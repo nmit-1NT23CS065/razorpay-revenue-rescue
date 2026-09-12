@@ -1,0 +1,1619 @@
+===== analyze.py =====
+import pandas as pd
+
+
+# Load transaction data
+df = pd.read_csv("data/transactions.csv")
+
+# Convert timestamp to datetime
+df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+
+# ---------------------------------------------------------
+# BASIC METRICS
+# ---------------------------------------------------------
+
+total_transactions = len(df)
+
+successful = df[df["status"] == "Success"]
+failed = df[df["status"] == "Failed"]
+
+total_revenue = successful["amount"].sum()
+failed_revenue = failed["amount"].sum()
+
+failure_rate = (len(failed) / total_transactions) * 100
+
+
+# ---------------------------------------------------------
+# FAILURE ANALYSIS
+# ---------------------------------------------------------
+
+failures_by_method = (
+    failed.groupby("payment_method")
+    .agg(
+        failed_transactions=("transaction_id", "count"),
+        revenue_at_risk=("amount", "sum")
+    )
+    .sort_values("revenue_at_risk", ascending=False)
+)
+
+
+# ---------------------------------------------------------
+# HOURLY FAILURE ANALYSIS
+# ---------------------------------------------------------
+
+df["hour"] = df["timestamp"].dt.hour
+
+hourly_failures = (
+    df[df["status"] == "Failed"]
+    .groupby("hour")
+    .agg(
+        failed_transactions=("transaction_id", "count"),
+        revenue_at_risk=("amount", "sum")
+    )
+    .sort_values("revenue_at_risk", ascending=False)
+)
+
+
+# ---------------------------------------------------------
+# FIND THE MOST PROBLEMATIC PERIOD
+# ---------------------------------------------------------
+
+worst_hour = hourly_failures.index[0]
+
+worst_hour_failures = hourly_failures.iloc[0]["failed_transactions"]
+
+worst_hour_revenue = hourly_failures.iloc[0]["revenue_at_risk"]
+
+
+# ---------------------------------------------------------
+# FIND UPI EVENING PROBLEM
+# ---------------------------------------------------------
+
+evening_upi = df[
+    (df["payment_method"] == "UPI")
+    & (df["timestamp"].dt.hour >= 20)
+    & (df["timestamp"].dt.hour < 22)
+]
+
+evening_upi_failures = evening_upi[
+    evening_upi["status"] == "Failed"
+]
+
+evening_upi_failure_rate = (
+    len(evening_upi_failures) / len(evening_upi)
+) * 100
+
+
+# ---------------------------------------------------------
+# ESTIMATE RECOVERABLE REVENUE
+# ---------------------------------------------------------
+
+# For the prototype, we assume 65% of failed transactions
+# are potentially recoverable.
+recoverable_percentage = 0.65
+
+potentially_recoverable = failed_revenue * recoverable_percentage
+
+
+# ---------------------------------------------------------
+# PRINT RESULTS
+# ---------------------------------------------------------
+
+print("\n" + "=" * 60)
+print("              REVENUE RESCUE AI")
+print("=" * 60)
+
+print("\n📊 OVERALL PAYMENT PERFORMANCE")
+
+print(f"Total transactions: {total_transactions:,}")
+
+print(f"Successful transactions: {len(successful):,}")
+
+print(f"Failed transactions: {len(failed):,}")
+
+print(f"Failure rate: {failure_rate:.2f}%")
+
+print(f"Successful revenue: ₹{total_revenue:,.0f}")
+
+print(f"Revenue at risk: ₹{failed_revenue:,.0f}")
+
+
+print("\n💳 FAILURE BY PAYMENT METHOD")
+
+print(failures_by_method.to_string())
+
+
+print("\n⏰ WORST FAILURE PERIOD")
+
+print(f"Worst hour: {worst_hour}:00")
+
+print(f"Failed transactions: {worst_hour_failures}")
+
+print(f"Revenue at risk: ₹{worst_hour_revenue:,.0f}")
+
+
+print("\n🚨 AI DETECTION")
+
+print(
+    f"UPI failure rate between 8 PM and 10 PM: "
+    f"{evening_upi_failure_rate:.2f}%"
+)
+
+print(
+    "Detected pattern: UPI payment failures spike "
+    "during the evening period."
+)
+
+
+print("\n💰 RECOVERY OPPORTUNITY")
+
+print(
+    f"Potentially recoverable revenue: "
+    f"₹{potentially_recoverable:,.0f}"
+)
+
+print(
+    f"Estimated recovery opportunity: "
+    f"{recoverable_percentage * 100:.0f}% of failed revenue"
+)
+
+
+print("\n" + "=" * 60)
+print("Analysis complete.")
+print("=" * 60)
+
+===== audit.py =====
+import json
+import os
+from datetime import datetime
+
+
+AUDIT_FILE = "data/audit_log.json"
+
+
+def ensure_audit_file():
+    os.makedirs("data", exist_ok=True)
+
+    if not os.path.exists(AUDIT_FILE):
+        with open(AUDIT_FILE, "w") as f:
+            json.dump([], f)
+
+
+def log_event(
+    event_type,
+    transaction_id=None,
+    action=None,
+    amount=None,
+    score=None,
+    reason=None,
+    result=None,
+    ml_success_probability=None
+):
+    ensure_audit_file()
+
+    with open(AUDIT_FILE, "r") as f:
+        logs = json.load(f)
+
+    event = {
+        "timestamp": datetime.now().isoformat(),
+        "event_type": event_type,
+        "transaction_id": transaction_id,
+        "action": action,
+        "amount": amount,
+        "recovery_score": score,
+        "ml_success_probability": ml_success_probability,
+        "reason": reason,
+        "result": result
+    }
+
+    logs.append(event)
+
+    with open(AUDIT_FILE, "w") as f:
+        json.dump(logs, f, indent=2)
+
+    return event
+
+
+def get_audit_log():
+    ensure_audit_file()
+
+    with open(AUDIT_FILE, "r") as f:
+        return json.load(f)
+
+===== evaluation.py =====
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    confusion_matrix
+)
+
+
+DATA_FILE = "data/transactions.csv"
+
+
+def evaluate_model():
+
+    # -----------------------------------------
+    # LOAD DATA
+    # -----------------------------------------
+
+    df = pd.read_csv(DATA_FILE)
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"]
+    )
+
+    # -----------------------------------------
+    # CREATE FEATURES
+    # -----------------------------------------
+
+    df["hour"] = df["timestamp"].dt.hour
+
+    df["day_of_week"] = (
+        df["timestamp"].dt.dayofweek
+    )
+
+    features = [
+        "amount",
+        "payment_method",
+        "hour",
+        "day_of_week"
+    ]
+
+    X = df[features]
+
+    # Success = 1
+    # Failure = 0
+    y = (
+        df["status"]
+        .astype(str)
+        .str.lower()
+        .eq("success")
+        .astype(int)
+    )
+
+    # -----------------------------------------
+    # TRAIN / TEST SPLIT
+    # -----------------------------------------
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        random_state=42,
+        stratify=y
+    )
+
+    # -----------------------------------------
+    # PREPROCESSING
+    # -----------------------------------------
+
+    numeric_features = [
+        "amount",
+        "hour",
+        "day_of_week"
+    ]
+
+    categorical_features = [
+        "payment_method"
+    ]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "categorical",
+                OneHotEncoder(
+                    handle_unknown="ignore"
+                ),
+                categorical_features
+            ),
+            (
+                "numeric",
+                "passthrough",
+                numeric_features
+            )
+        ]
+    )
+
+    # -----------------------------------------
+    # MODEL
+    # -----------------------------------------
+
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=8,
+        min_samples_leaf=5,
+        random_state=42,
+        class_weight="balanced"
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                preprocessor
+            ),
+            (
+                "model",
+                model
+            )
+        ]
+    )
+
+    # -----------------------------------------
+    # TRAIN
+    # -----------------------------------------
+
+    pipeline.fit(
+        X_train,
+        y_train
+    )
+
+    # -----------------------------------------
+    # PREDICTIONS
+    # -----------------------------------------
+
+    predictions = pipeline.predict(
+        X_test
+    )
+
+    probabilities = pipeline.predict_proba(
+        X_test
+    )[:, 1]
+
+    # -----------------------------------------
+    # METRICS
+    # -----------------------------------------
+
+    accuracy = accuracy_score(
+        y_test,
+        predictions
+    )
+
+    precision = precision_score(
+        y_test,
+        predictions,
+        zero_division=0
+    )
+
+    recall = recall_score(
+        y_test,
+        predictions,
+        zero_division=0
+    )
+
+    roc_auc = roc_auc_score(
+        y_test,
+        probabilities
+    )
+
+    matrix = confusion_matrix(
+        y_test,
+        predictions
+    )
+
+    # -----------------------------------------
+    # OUTPUT
+    # -----------------------------------------
+
+    print()
+    print("=" * 50)
+    print("REVENUE RESCUE AI - ML EVALUATION")
+    print("=" * 50)
+
+    print()
+    print("Dataset")
+    print("-" * 50)
+
+    print(
+        f"Total transactions: {len(df)}"
+    )
+
+    print(
+        f"Training transactions: {len(X_train)}"
+    )
+
+    print(
+        f"Test transactions: {len(X_test)}"
+    )
+
+    print()
+    print("Features")
+    print("-" * 50)
+
+    for feature in features:
+        print(f"- {feature}")
+
+    print()
+    print("Model")
+    print("-" * 50)
+
+    print(
+        "RandomForestClassifier"
+    )
+
+    print()
+    print("Performance")
+    print("-" * 50)
+
+    print(
+        f"Accuracy : {accuracy:.4f} "
+        f"({accuracy * 100:.2f}%)"
+    )
+
+    print(
+        f"Precision: {precision:.4f} "
+        f"({precision * 100:.2f}%)"
+    )
+
+    print(
+        f"Recall   : {recall:.4f} "
+        f"({recall * 100:.2f}%)"
+    )
+
+    print(
+        f"ROC-AUC  : {roc_auc:.4f}"
+    )
+
+    print()
+    print("Confusion Matrix")
+    print("-" * 50)
+
+    print(matrix)
+
+    print()
+    print("=" * 50)
+    print("EVALUATION COMPLETE")
+    print("=" * 50)
+    print()
+
+
+if __name__ == "__main__":
+    evaluate_model()
+
+===== generate_data.py =====
+import csv
+import random
+from datetime import datetime, timedelta
+
+random.seed(42)
+
+methods = ["UPI", "Card", "NetBanking", "Wallet"]
+failure_reasons = [
+    "Bank timeout",
+    "Insufficient funds",
+    "Network error",
+    "Payment declined",
+    "Authentication failed",
+]
+
+rows = []
+
+start_time = datetime(2026, 9, 1, 8, 0)
+
+for i in range(2000):
+    transaction_id = f"TXN{i+1:05d}"
+
+    # Spread transactions across a single day
+    minutes_after_start = random.randint(0, 840)
+    timestamp = start_time + timedelta(minutes=minutes_after_start)
+
+    amount = random.randint(200, 25000)
+
+    method = random.choices(
+        methods,
+        weights=[50, 30, 15, 5],
+        k=1
+    )[0]
+
+    # Normal baseline failure probability
+    failure_probability = 0.08
+
+    # Create a deliberate UPI failure spike between 8 PM and 10 PM.
+    # This gives our AI something meaningful to discover.
+    if (
+        method == "UPI"
+        and timestamp.hour >= 20
+        and timestamp.hour < 22
+    ):
+        failure_probability = 0.38
+
+    status = "Success"
+
+    if random.random() < failure_probability:
+        status = "Failed"
+
+    failure_reason = ""
+
+    if status == "Failed":
+        failure_reason = random.choice(failure_reasons)
+
+    rows.append([
+        transaction_id,
+        timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        amount,
+        method,
+        status,
+        failure_reason,
+    ])
+
+
+with open("data/transactions.csv", "w", newline="", encoding="utf-8") as file:
+    writer = csv.writer(file)
+
+    writer.writerow([
+        "transaction_id",
+        "timestamp",
+        "amount",
+        "payment_method",
+        "status",
+        "failure_reason",
+    ])
+
+    writer.writerows(rows)
+
+
+print("✅ Transaction dataset created successfully!")
+print("📊 Total transactions:", len(rows))
+print("📁 Saved to: data/transactions.csv")
+
+===== main.py =====
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+
+from recovery import generate_recovery_plan
+from audit import log_event, get_audit_log
+from safety import check_transaction_safety, check_campaign_safety
+
+
+app = FastAPI(
+    title="Revenue Rescue AI"
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def home():
+    return {
+        "message": "Revenue Rescue AI backend is running"
+    }
+
+
+@app.get("/api/analyze")
+def analyze_revenue():
+
+    df = pd.read_csv("data/transactions.csv")
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"]
+    )
+
+    total_transactions = len(df)
+
+    successful = df[
+        df["status"] == "Success"
+    ]
+
+    failed = df[
+        df["status"] == "Failed"
+    ]
+
+    successful_revenue = int(
+        successful["amount"].sum()
+    )
+
+    revenue_at_risk = int(
+        failed["amount"].sum()
+    )
+
+    failure_rate = (
+        len(failed)
+        / total_transactions
+    ) * 100
+
+    evening_upi = df[
+        (df["payment_method"] == "UPI")
+        & (df["timestamp"].dt.hour >= 20)
+        & (df["timestamp"].dt.hour < 22)
+    ]
+
+    evening_upi_failures = evening_upi[
+        evening_upi["status"] == "Failed"
+    ]
+
+    if len(evening_upi) > 0:
+
+        evening_upi_failure_rate = (
+            len(evening_upi_failures)
+            / len(evening_upi)
+        ) * 100
+
+    else:
+
+        evening_upi_failure_rate = 0
+
+    recovery_plan = generate_recovery_plan()
+
+    estimated_recovery = recovery_plan[
+        "estimated_recovery"
+    ]
+
+    recoverable_percentage = (
+        estimated_recovery
+        / revenue_at_risk
+    ) * 100 if revenue_at_risk > 0 else 0
+
+    return {
+
+        "total_transactions": int(
+            total_transactions
+        ),
+
+        "successful_transactions": int(
+            len(successful)
+        ),
+
+        "failed_transactions": int(
+            len(failed)
+        ),
+
+        "failure_rate": round(
+            failure_rate,
+            2
+        ),
+
+        "successful_revenue": successful_revenue,
+
+        "revenue_at_risk": revenue_at_risk,
+
+        "potentially_recoverable": int(
+            estimated_recovery
+        ),
+
+        "recoverable_percentage": round(
+            recoverable_percentage,
+            2
+        ),
+
+        "evening_upi_failure_rate": round(
+            evening_upi_failure_rate,
+            2
+        ),
+
+        "ai_detection":
+            "UPI payment failures spike between "
+            "8 PM and 10 PM.",
+
+        "recommendation":
+            "Prioritize high-scoring failed payments "
+            "for automated retry, send reminders to "
+            "medium-score customers, and route low-score "
+            "or high-value transactions to human review."
+    }
+
+
+@app.get("/api/recovery-plan")
+def recovery_plan():
+
+    return generate_recovery_plan()
+
+
+@app.post("/api/execute-recovery")
+def execute_recovery():
+
+    # -----------------------------------------
+    # IDEMPOTENCY CHECK
+    # -----------------------------------------
+
+    existing_logs = get_audit_log()
+
+    completed_campaigns = [
+        event
+        for event in existing_logs
+        if event.get("event_type")
+        == "RECOVERY_CAMPAIGN"
+        and event.get("result")
+        == "SIMULATION_COMPLETED"
+    ]
+
+    if completed_campaigns:
+
+        latest_campaign = completed_campaigns[-1]
+
+        return {
+            "status": "ALREADY_EXECUTED",
+            "message":
+                "Recovery campaign has already been executed.",
+            "retry_actions": 0,
+            "reminders_sent": 0,
+            "human_reviews": 0,
+            "recovered_revenue":
+                latest_campaign.get("amount", 0),
+            "execution_mode": "SIMULATION",
+            "safety_status": "LOCKED",
+            "note":
+                "Duplicate execution prevented by "
+                "idempotency protection."
+        }
+
+    # -----------------------------------------
+    # GENERATE PLAN
+    # -----------------------------------------
+
+    plan = generate_recovery_plan()
+
+    # -----------------------------------------
+    # CAMPAIGN SAFETY CHECK
+    # -----------------------------------------
+
+    campaign_safety = check_campaign_safety(
+        automated_value=plan["retry_value"],
+        total_failed_value=plan["total_failed_value"]
+    )
+
+    if not campaign_safety["allowed"]:
+
+        log_event(
+            event_type="SAFETY_STOP",
+            action="STOP_RECOVERY_CAMPAIGN",
+            amount=plan["retry_value"],
+            result=campaign_safety["reason"]
+        )
+
+        return {
+
+            "status": "STOPPED",
+
+            "message":
+                "Recovery campaign stopped by safety controls.",
+
+            "retry_actions": 0,
+
+            "reminders_sent": 0,
+
+            "human_reviews":
+                plan["total_failed_transactions"],
+
+            "recovered_revenue": 0,
+
+            "execution_mode": "SIMULATION",
+
+            "safety_status": "BLOCKED",
+
+            "safety_reason":
+                campaign_safety["reason"],
+
+            "note":
+                "No recovery actions were executed."
+        }
+
+    # -----------------------------------------
+    # EXECUTION
+    # -----------------------------------------
+
+    executed_retries = 0
+    executed_reminders = 0
+    escalated_reviews = 0
+
+    recovered_from_retry = 0
+    recovered_from_reminders = 0
+
+    for decision in plan["all_decisions"]:
+
+        transaction_id = decision[
+            "transaction_id"
+        ]
+
+        amount = decision[
+            "amount"
+        ]
+
+        action = decision[
+            "recommended_action"
+        ]
+
+        score = decision[
+            "recovery_score"
+        ]
+
+        reason = decision[
+            "failure_reason"
+        ]
+
+        ml_probability = decision.get(
+            "ml_success_probability"
+        )
+
+        # -----------------------------------------
+        # TRANSACTION SAFETY
+        # -----------------------------------------
+
+        safety_result = check_transaction_safety(
+            amount=amount,
+            action=action,
+            previous_attempts=0
+        )
+
+        if not safety_result["allowed"]:
+
+            escalated_reviews += 1
+
+            log_event(
+                event_type="SAFETY_ESCALATION",
+                transaction_id=transaction_id,
+                action="HUMAN_REVIEW",
+                amount=amount,
+                score=score,
+                ml_success_probability=ml_probability,
+                reason=safety_result["reason"],
+                result="BLOCKED_BY_SAFETY_RULE"
+            )
+
+            continue
+
+        # -----------------------------------------
+        # RETRY
+        # -----------------------------------------
+
+        if action == "RETRY":
+
+            executed_retries += 1
+
+            recovered_from_retry += int(
+                amount * 0.75
+            )
+
+            log_event(
+                event_type="RECOVERY_DECISION",
+                transaction_id=transaction_id,
+                action="RETRY",
+                amount=amount,
+                score=score,
+                ml_success_probability=ml_probability,
+                reason=reason,
+                result="SIMULATED_RETRY"
+            )
+
+        # -----------------------------------------
+        # REMINDER
+        # -----------------------------------------
+
+        elif action == "SEND_REMINDER":
+
+            executed_reminders += 1
+
+            recovered_from_reminders += int(
+                amount * 0.40
+            )
+
+            log_event(
+                event_type="RECOVERY_DECISION",
+                transaction_id=transaction_id,
+                action="SEND_REMINDER",
+                amount=amount,
+                score=score,
+                ml_success_probability=ml_probability,
+                reason=reason,
+                result="SIMULATED_REMINDER"
+            )
+
+        # -----------------------------------------
+        # HUMAN REVIEW
+        # -----------------------------------------
+
+        else:
+
+            escalated_reviews += 1
+
+            log_event(
+                event_type="RECOVERY_DECISION",
+                transaction_id=transaction_id,
+                action="HUMAN_REVIEW",
+                amount=amount,
+                score=score,
+                ml_success_probability=ml_probability,
+                reason=reason,
+                result="ESCALATED_FOR_HUMAN_REVIEW"
+            )
+
+    # -----------------------------------------
+    # FINAL RECOVERY
+    # -----------------------------------------
+
+    recovered_revenue = (
+        recovered_from_retry
+        + recovered_from_reminders
+    )
+
+    # -----------------------------------------
+    # CAMPAIGN AUDIT
+    # -----------------------------------------
+
+    log_event(
+        event_type="RECOVERY_CAMPAIGN",
+        action="EXECUTE_RECOVERY_PLAN",
+        amount=recovered_revenue,
+        result="SIMULATION_COMPLETED"
+    )
+
+    # -----------------------------------------
+    # RESPONSE
+    # -----------------------------------------
+
+    return {
+
+        "status": "EXECUTED",
+
+        "message":
+            "Recovery plan executed successfully.",
+
+        "retry_actions":
+            executed_retries,
+
+        "reminders_sent":
+            executed_reminders,
+
+        "human_reviews":
+            escalated_reviews,
+
+        "recovered_revenue":
+            recovered_revenue,
+
+        "execution_mode":
+            "SIMULATION",
+
+        "safety_status":
+            "PASSED",
+
+        "automated_retry_value":
+            int(plan["retry_value"]),
+
+        "automated_value_percent":
+            campaign_safety[
+                "automated_value_percent"
+            ],
+
+        "note":
+            "No real payments were processed. "
+            "Safety controls, stopping rules, and "
+            "duplicate-execution protection were applied."
+    }
+
+
+@app.get("/api/audit-log")
+def audit_log():
+
+    return {
+        "events": get_audit_log()
+    }
+
+===== ml_model.py =====
+import os
+import joblib
+import pandas as pd
+
+from functools import lru_cache
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+
+
+MODEL_FILE = "recovery_model.joblib"
+DATA_FILE = "data/transactions.csv"
+
+
+FEATURES = [
+    "amount",
+    "payment_method",
+    "hour",
+    "day_of_week",
+]
+
+
+def prepare_data():
+    df = pd.read_csv(DATA_FILE)
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    df["hour"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+
+    df["target"] = (
+        df["status"].astype(str).str.lower() == "success"
+    ).astype(int)
+
+    return df
+
+
+def train_model():
+    """
+    Train the Random Forest payment-success model.
+    """
+
+    df = prepare_data()
+
+    X = df[FEATURES]
+    y = df["target"]
+
+    numeric_features = [
+        "amount",
+        "hour",
+        "day_of_week",
+    ]
+
+    categorical_features = [
+        "payment_method",
+    ]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "categorical",
+                OneHotEncoder(
+                    handle_unknown="ignore"
+                ),
+                categorical_features,
+            ),
+            (
+                "numeric",
+                "passthrough",
+                numeric_features,
+            ),
+        ]
+    )
+
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=8,
+        min_samples_leaf=5,
+        random_state=42,
+        class_weight="balanced",
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("model", model),
+        ]
+    )
+
+    pipeline.fit(X, y)
+
+    joblib.dump(pipeline, MODEL_FILE)
+
+    return {
+        "model_file": MODEL_FILE,
+        "training_rows": len(df),
+        "features": FEATURES,
+    }
+
+
+@lru_cache(maxsize=1)
+def load_model():
+    """
+    Load the model only once per server process.
+
+    Previously the model was loaded from disk for
+    every transaction, which caused major delays.
+    """
+
+    if not os.path.exists(MODEL_FILE):
+        train_model()
+
+    return joblib.load(MODEL_FILE)
+
+
+def _build_input_data(rows):
+    """
+    Convert transaction rows into ML feature data.
+    """
+
+    input_rows = []
+
+    for row in rows:
+
+        timestamp = pd.to_datetime(row["timestamp"])
+
+        input_rows.append({
+            "amount": float(row["amount"]),
+            "payment_method": row["payment_method"],
+            "hour": timestamp.hour,
+            "day_of_week": timestamp.dayofweek,
+        })
+
+    return pd.DataFrame(input_rows)
+
+
+def predict_success_probabilities(rows):
+    """
+    Predict payment-success probabilities for an entire
+    batch of transactions in one ML call.
+    """
+
+    if len(rows) == 0:
+        return []
+
+    model = load_model()
+
+    input_data = _build_input_data(rows)
+
+    probabilities = model.predict_proba(input_data)[:, 1]
+
+    return [
+        float(probability)
+        for probability in probabilities
+    ]
+
+
+def predict_success_probability(row):
+    """
+    Predict success probability for one transaction.
+
+    Kept for compatibility with the rest of the project.
+    The trained model itself is still cached.
+    """
+
+    probabilities = predict_success_probabilities([row])
+
+    return probabilities[0]
+
+
+if __name__ == "__main__":
+
+    result = train_model()
+
+    print("ML MODEL TRAINED")
+    print("----------------")
+    print(
+        f"Training rows: {result['training_rows']}"
+    )
+    print(
+        f"Features: {', '.join(result['features'])}"
+    )
+    print(
+        f"Saved to: {result['model_file']}"
+    )
+
+===== recovery.py =====
+import pandas as pd
+
+from ml_model import predict_success_probabilities
+
+
+def calculate_rule_score(row):
+    score = 50
+
+    reason = str(row["failure_reason"]).lower()
+    method = str(row["payment_method"]).lower()
+    amount = float(row["amount"])
+
+    # -----------------------------------------
+    # FAILURE REASON
+    # -----------------------------------------
+
+    if "bank timeout" in reason:
+        score += 25
+
+    elif "network error" in reason:
+        score += 22
+
+    elif "authentication" in reason:
+        score += 10
+
+    elif "payment declined" in reason:
+        score += 5
+
+    elif "insufficient funds" in reason:
+        score -= 5
+
+    # -----------------------------------------
+    # PAYMENT METHOD
+    # -----------------------------------------
+
+    if method == "upi":
+        score += 5
+
+    elif method == "card":
+        score += 3
+
+    elif method == "netbanking":
+        score += 1
+
+    # -----------------------------------------
+    # TRANSACTION AMOUNT
+    # -----------------------------------------
+
+    if amount <= 10000:
+        score += 10
+
+    elif amount <= 25000:
+        score += 5
+
+    elif amount <= 50000:
+        score -= 5
+
+    else:
+        score -= 20
+
+    return max(0, min(100, score))
+
+
+def calculate_recovery_score(row, ml_probability):
+    """
+    Combine deterministic business rules with
+    the ML signal.
+
+    ML has intentionally limited influence so that
+    business safety rules remain dominant.
+    """
+
+    rule_score = calculate_rule_score(row)
+
+    ml_score = ml_probability * 100
+
+    # ML can adjust the rule score by only 10%
+    # of its difference from the neutral 50 score.
+    ml_adjustment = (ml_score - 50) * 0.10
+
+    final_score = rule_score + ml_adjustment
+
+    return max(0, min(100, final_score))
+
+
+def determine_action(score, amount):
+    """
+    Safety-aware recovery action.
+    """
+
+    # -----------------------------------------
+    # SAFETY RULE
+    # -----------------------------------------
+
+    # Never automatically retry high-value
+    # transactions.
+    if amount > 50000:
+        return "HUMAN_REVIEW"
+
+    # -----------------------------------------
+    # RECOVERY DECISION
+    # -----------------------------------------
+
+    if score >= 75:
+        return "RETRY"
+
+    if score >= 55:
+        return "SEND_REMINDER"
+
+    return "HUMAN_REVIEW"
+
+
+def generate_recovery_plan():
+
+    # -----------------------------------------
+    # LOAD DATA
+    # -----------------------------------------
+
+    df = pd.read_csv("data/transactions.csv")
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"]
+    )
+
+    # Only failed payments require recovery.
+    failed = df[
+        df["status"] == "Failed"
+    ].copy()
+
+    # -----------------------------------------
+    # ML PREDICTION
+    # -----------------------------------------
+
+    # IMPORTANT:
+    # Predict all failed transactions in ONE
+    # batch instead of loading/predicting the
+    # model separately for every transaction.
+
+    failed_rows = [
+        row
+        for _, row in failed.iterrows()
+    ]
+
+    ml_probabilities = predict_success_probabilities(
+        failed_rows
+    )
+
+    failed["ml_success_probability"] = (
+        ml_probabilities
+    )
+
+    # -----------------------------------------
+    # RECOVERY SCORE
+    # -----------------------------------------
+
+    failed["recovery_score"] = [
+        calculate_recovery_score(
+            row,
+            probability
+        )
+        for (_, row), probability
+        in zip(
+            failed.iterrows(),
+            ml_probabilities
+        )
+    ]
+
+    # -----------------------------------------
+    # RECOMMENDED ACTION
+    # -----------------------------------------
+
+    failed["recommended_action"] = failed.apply(
+        lambda row: determine_action(
+            row["recovery_score"],
+            row["amount"]
+        ),
+        axis=1
+    )
+
+    # -----------------------------------------
+    # GROUP ACTIONS
+    # -----------------------------------------
+
+    retry = failed[
+        failed["recommended_action"] == "RETRY"
+    ]
+
+    reminders = failed[
+        failed["recommended_action"] == "SEND_REMINDER"
+    ]
+
+    human_review = failed[
+        failed["recommended_action"] == "HUMAN_REVIEW"
+    ]
+
+    retry_value = retry["amount"].sum()
+
+    reminder_value = reminders["amount"].sum()
+
+    review_value = human_review["amount"].sum()
+
+    total_failed_value = failed["amount"].sum()
+
+    # -----------------------------------------
+    # ESTIMATED RECOVERY
+    # -----------------------------------------
+
+    estimated_recovery = (
+        retry_value * 0.75
+        + reminder_value * 0.40
+    )
+
+    # -----------------------------------------
+    # TOP CANDIDATES
+    # -----------------------------------------
+
+    top_candidates = (
+        failed
+        .sort_values(
+            ["recovery_score", "amount"],
+            ascending=[False, False]
+        )
+        .head(10)
+    )
+
+    candidates = []
+
+    for _, row in top_candidates.iterrows():
+
+        candidates.append({
+            "transaction_id": row["transaction_id"],
+            "amount": int(row["amount"]),
+            "payment_method": row["payment_method"],
+            "failure_reason": row["failure_reason"],
+            "recovery_score": round(
+                float(row["recovery_score"]),
+                2
+            ),
+            "ml_success_probability": round(
+                float(row["ml_success_probability"]),
+                4
+            ),
+            "recommended_action": row[
+                "recommended_action"
+            ],
+        })
+
+    # -----------------------------------------
+    # COMPLETE DECISION LIST
+    # -----------------------------------------
+
+    all_decisions = []
+
+    for _, row in failed.iterrows():
+
+        all_decisions.append({
+            "transaction_id": row["transaction_id"],
+            "amount": int(row["amount"]),
+            "payment_method": row["payment_method"],
+            "failure_reason": row["failure_reason"],
+            "recovery_score": round(
+                float(row["recovery_score"]),
+                2
+            ),
+            "ml_success_probability": round(
+                float(row["ml_success_probability"]),
+                4
+            ),
+            "recommended_action": row[
+                "recommended_action"
+            ],
+        })
+
+    # -----------------------------------------
+    # FINAL RESPONSE
+    # -----------------------------------------
+
+    return {
+
+        "total_failed_transactions": int(
+            len(failed)
+        ),
+
+        "total_failed_value": int(
+            total_failed_value
+        ),
+
+        "retry_count": int(
+            len(retry)
+        ),
+
+        "retry_value": int(
+            retry_value
+        ),
+
+        "reminder_count": int(
+            len(reminders)
+        ),
+
+        "reminder_value": int(
+            reminder_value
+        ),
+
+        "human_review_count": int(
+            len(human_review)
+        ),
+
+        "human_review_value": int(
+            review_value
+        ),
+
+        "estimated_recovery": int(
+            estimated_recovery
+        ),
+
+        "top_candidates": candidates,
+
+        "all_decisions": all_decisions,
+
+        # ML information
+        "ml_enabled": True,
+
+        "ml_model": "RandomForestClassifier",
+
+        "ml_features": [
+            "amount",
+            "payment_method",
+            "hour",
+            "day_of_week"
+        ],
+    }
+
+===== safety.py =====
+MAX_AUTOMATED_RETRIES = 1
+
+# Transactions above this amount always require
+# human approval before recovery execution.
+HIGH_VALUE_LIMIT = 50000
+
+# Maximum percentage of failed transaction value that
+# can be placed into an automated recovery campaign.
+MAX_AUTOMATED_VALUE_PERCENT = 70
+
+
+def check_transaction_safety(
+    amount,
+    action,
+    previous_attempts=0
+):
+    """
+    Apply transaction-level safety rules.
+    """
+
+    # High-value transactions require human review.
+    if amount > HIGH_VALUE_LIMIT:
+        return {
+            "allowed": False,
+            "action": "HUMAN_REVIEW",
+            "reason": "Transaction exceeds automated recovery value limit."
+        }
+
+    # Never automatically retry more than once.
+    if action == "RETRY":
+        if previous_attempts >= MAX_AUTOMATED_RETRIES:
+            return {
+                "allowed": False,
+                "action": "HUMAN_REVIEW",
+                "reason": "Maximum automated retry limit reached."
+            }
+
+    return {
+        "allowed": True,
+        "action": action,
+        "reason": "Transaction passed safety checks."
+    }
+
+
+def check_campaign_safety(
+    automated_value,
+    total_failed_value
+):
+    """
+    Campaign-level stopping rule.
+
+    Prevents the system from automatically acting on
+    an excessive portion of the failed revenue.
+    """
+
+    if total_failed_value <= 0:
+        return {
+            "allowed": False,
+            "reason": "No failed revenue available for recovery."
+        }
+
+    percentage = (
+        automated_value
+        / total_failed_value
+    ) * 100
+
+    if percentage > MAX_AUTOMATED_VALUE_PERCENT:
+        return {
+            "allowed": False,
+            "reason": (
+                "Automated recovery value exceeds "
+                "campaign safety threshold."
+            ),
+            "automated_value_percent": round(
+                percentage,
+                2
+            )
+        }
+
+    return {
+        "allowed": True,
+        "reason": "Campaign passed safety checks.",
+        "automated_value_percent": round(
+            percentage,
+            2
+        )
+    }
+
